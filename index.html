@@ -373,20 +373,24 @@ var PARTS = [
 /* =========================================================
    3. STATE
    ========================================================= */
-var STORAGE_KEY = "brgy_survey_records_v1";
+/* PASTE your deployed Google Apps Script Web App URL here (ends in /exec) */
+var APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwxHNbGOPFySczEg2CoakgDHrlU3Kk-IvGoOV4Vji6qa5ol9_-Nrxl7z_n68SmzbRk1/exec";
+
 var state = {
-  screen:"home",         // home | form | review
+  screen:"home",         // home | form | review | loading
   barangay:null,
   partIndex:0,
   answers:{}
 };
 
-function loadRecords(){
-  try{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); }
-  catch(e){ return {}; }
-}
-function saveRecords(records){
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+/* completedBarangays: null = not fetched yet, array = shared list from the sheet */
+var completedBarangays = null;
+
+function fetchCompletedBarangays(){
+  return fetch(APPS_SCRIPT_URL)
+    .then(function(res){ return res.json(); })
+    .then(function(data){ return data.completed || []; })
+    .catch(function(err){ console.error(err); return null; });
 }
 
 function blankAnswers(){
@@ -419,16 +423,33 @@ function render(){
 }
 
 function renderHome(){
-  var records = loadRecords();
-  var doneCount = Object.keys(records).length;
-  var remaining = BARANGAYS.filter(function(name){ return !records[name]; });
+  if(completedBarangays === null){
+    app.innerHTML = '<div class="sheet">' + docTitleBlock() +
+      '<p class="center-note">Loading barangay list…</p></div>';
+    fetchCompletedBarangays().then(function(list){
+      if(list === null){
+        app.innerHTML = '<div class="sheet">' + docTitleBlock() +
+          '<p class="center-note">Could not load the barangay list. Check your internet connection and ' +
+          '<a href="#" id="retryLoad">tap here to retry</a>.</p></div>';
+        var retry = document.getElementById("retryLoad");
+        if(retry) retry.addEventListener("click", function(e){ e.preventDefault(); render(); });
+        return;
+      }
+      completedBarangays = list;
+      render();
+    });
+    return;
+  }
+
+  var doneCount = completedBarangays.length;
+  var remaining = BARANGAYS.filter(function(name){ return completedBarangays.indexOf(name) === -1; });
   var html = '';
   html += '<div class="sheet">';
   html += docTitleBlock();
-  html += '<div class="progress-summary">' + doneCount + ' of ' + BARANGAYS.length + ' barangays completed on this device.</div>';
+  html += '<div class="progress-summary">' + doneCount + ' of ' + BARANGAYS.length + ' barangays completed.</div>';
   html += '<div class="home-picker">';
   if(remaining.length === 0){
-    html += '<div class="all-done-note">All 27 barangays have a saved response on this device.</div>';
+    html += '<div class="all-done-note">All 27 barangays have a saved response.</div>';
   } else {
     html += '<label class="q" for="brgySelect">Select barangay to survey</label>';
     html += '<select id="brgySelect">';
@@ -439,7 +460,7 @@ function renderHome(){
     html += '<button class="primary" id="btnStart">Start Survey</button>';
   }
   html += '</div>';
-  html += '<p class="center-note">A barangay drops off this list once its response has been saved. Already-completed barangays are not shown here.</p>';
+  html += '<p class="center-note">A barangay drops off this list once its response has been saved, for everyone using this link. Already-completed barangays are not shown here.</p>';
   html += '</div>';
   app.innerHTML = html;
 
@@ -677,9 +698,9 @@ function qaLine(label, val){
    5. SAVE: local record + XLSX export (no external libraries)
    ========================================================= */
 function confirmAndSave(){
-  var records = loadRecords();
-  if(records[state.barangay]){
-    alert(state.barangay + " already has a saved response (from " + records[state.barangay].dateSaved + "). It cannot be submitted again. Returning to the barangay list.");
+  if(completedBarangays && completedBarangays.indexOf(state.barangay) !== -1){
+    alert(state.barangay + " already has a saved response. Returning to the barangay list.");
+    completedBarangays = null; // refresh from server
     state.screen = "home";
     state.barangay = null;
     render();
@@ -689,21 +710,48 @@ function confirmAndSave(){
   var today = new Date();
   var dateStr = today.getFullYear() + "-" + pad2(today.getMonth()+1) + "-" + pad2(today.getDate());
 
-  // 1) persist to localStorage (source of truth on this device)
-  var records = loadRecords();
-  records[state.barangay] = { dateSaved: dateStr, answers: state.answers };
-  saveRecords(records);
+  var payload = {
+    barangay: state.barangay,
+    dateSaved: dateStr,
+    fields: flattenAnswersForSheet()
+  };
 
-  // 2) build and download the .xlsx for this barangay only
-  var rows = flattenAnswersForExport();
-  var fileBytes = buildXlsx(rows);
-  var fname = sanitizeFilename(state.barangay) + "_" + dateStr + ".xlsx";
-  downloadBlob(fileBytes, fname);
+  setSubmitting(true);
 
-  // 3) back to home
-  state.screen = "home";
-  state.barangay = null;
-  render();
+  fetch(APPS_SCRIPT_URL, {
+    method: "POST",
+    headers: {"Content-Type": "text/plain;charset=utf-8"}, // avoids CORS preflight on Apps Script
+    body: JSON.stringify(payload)
+  })
+  .then(function(res){ return res.json(); })
+  .then(function(data){
+    if(data.status === "ok"){
+      completedBarangays = null; // force refresh so the dropdown reflects this submission
+      state.screen = "home";
+      state.barangay = null;
+      render();
+    } else if(data.status === "duplicate"){
+      alert(state.barangay + " already has a saved response from another device. Returning to the barangay list.");
+      completedBarangays = null;
+      state.screen = "home";
+      state.barangay = null;
+      render();
+    } else {
+      alert("Something went wrong saving the response. Please check your internet connection and try again.");
+      setSubmitting(false);
+    }
+  })
+  .catch(function(err){
+    alert("Could not reach the server. Please check your internet connection and try again — your answers are still on this screen.");
+    setSubmitting(false);
+  });
+}
+
+function setSubmitting(isSubmitting){
+  var btn = document.getElementById("btnConfirmSave");
+  if(!btn) return;
+  btn.disabled = isSubmitting;
+  btn.textContent = isSubmitting ? "Submitting…" : "Confirm & Save";
 }
 
 function pad2(n){ return (n < 10 ? "0" : "") + n; }
@@ -718,6 +766,27 @@ function flattenAnswersForExport(){
   rows.push(["Date Responded", state.answers.date_accomplished || ""]);
   PARTS.forEach(function(part){
     rows.push([part.title, ""]); // section marker row
+    part.fields.forEach(function(f){
+      if(f.type === "table"){
+        f.rows.forEach(function(rowLabel, rIdx){
+          f.columns.forEach(function(col, cIdx){
+            var val = state.answers[f.id][rIdx][cIdx] || "";
+            rows.push([f.label + " — " + rowLabel + " — " + col.label, val]);
+          });
+        });
+      } else {
+        var v = state.answers[f.id];
+        if(Array.isArray(v)) v = v.join(", ");
+        rows.push([f.label, v || ""]);
+      }
+    });
+  });
+  return rows;
+}
+
+function flattenAnswersForSheet(){
+  var rows = [];
+  PARTS.forEach(function(part){
     part.fields.forEach(function(f){
       if(f.type === "table"){
         f.rows.forEach(function(rowLabel, rIdx){
